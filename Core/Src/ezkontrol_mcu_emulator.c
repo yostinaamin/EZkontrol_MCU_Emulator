@@ -1,0 +1,602 @@
+/*
+ * ezkontrol_mcu_emulator.c
+ *
+ * STM32F103 HAL module emulating an EZkontrol MCU1 (motor controller,
+ * address 0xEF) over CAN, for bench-testing the EZkontrol_VCU project
+ * before a real 72V controller is connected.
+ *
+ * This node:
+ *   1) Initiates the startup handshake (0x55 pattern on 0x1801D0EF)
+ *   2) Waits for the VCU's handshake reply (0xAA pattern on 0x0C01EFD0)
+ *   3) Receives VCU RUN/speed/torque commands (0x0C01EFD0, normal payload)
+ *   4) Runs a simple ramping motor model so simulated speed/current
+ *      visibly follow commanded RUN state and targets
+ *   5) Transmits MCU1->VCU feedback (0x1801D0EF, 0x1802D0EF)
+ *   6) Optionally transmits MCU1->Meter frames (0x180117EF, 0x180217EF)
+ *   7) Implements a 250 ms command watchdog (safe halt on command loss)
+ *
+ * There is no real power stage here - all "motor" behavior is a software
+ * model used only to prove CAN communication and value tracking.
+ *
+ * CubeMX assumption, 500 kbit/s:
+ *   CAN clock 36 MHz, Prescaler=4, SJW=1TQ, BS1=15TQ, BS2=2TQ, Mode=NORMAL
+ *   CAN1 RX FIFO1 interrupt enabled.
+ *
+ * Usage from main.c:
+ *   after MX_GPIO_Init() and MX_CAN_Init():
+ *       EZK_MCU_Emulator_Init();
+ *   inside while(1):
+ *       EZK_MCU_Emulator_Task();
+ *
+ * GPIO (Blue Pill):
+ *   PB0  = HANDSHAKE established
+ *   PB1  = COMMAND HEARTBEAT (toggles on each valid VCU command)
+ *   PB10 = RUN (mirrors simulated controller_running)
+ *   PB11 = TIMEOUT/WARNING (on before handshake, on during command loss)
+ *
+ * There is only ONE implementation of HAL_CAN_RxFifo1MsgPendingCallback()
+ * and of each HAL_CAN_TxMailboxXCompleteCallback() in this project.
+ */
+
+#include "main.h"
+#include "ezkontrol_mcu_emulator.h"
+#include "ezkontrol_protocol.h"
+#include <stdint.h>
+#include <stdlib.h>
+
+extern CAN_HandleTypeDef hcan;
+
+/* Timing periods (milliseconds) */
+#define HANDSHAKE_PERIOD_MS      250U
+#define STATUS1_PERIOD_MS        50U
+#define STATUS2_PERIOD_MS        50U
+#define METER1_PERIOD_MS         100U
+#define METER2_PERIOD_MS         100U
+#define SIM_PERIOD_MS            20U
+#define COMMAND_WATCHDOG_MS      250U
+
+/* -------- LED GPIO assignments -------- */
+#define LED_HANDSHAKE_PORT       GPIOB
+#define LED_HANDSHAKE_PIN        GPIO_PIN_0
+#define LED_HEARTBEAT_PORT       GPIOB
+#define LED_HEARTBEAT_PIN        GPIO_PIN_1
+#define LED_RUN_PORT             GPIOB
+#define LED_RUN_PIN              GPIO_PIN_10
+#define LED_WARNING_PORT         GPIOB
+#define LED_WARNING_PIN          GPIO_PIN_11
+
+/* ======================================================================
+ * Live Expression / debug variables
+ * ====================================================================== */
+
+/* --- Handshake --- */
+volatile uint32_t emu_handshake_tx_count = 0;
+volatile uint32_t emu_handshake_reply_count = 0;
+volatile uint8_t  emu_handshake_established = 0;
+
+/* --- Command reception (decoded VCU -> MCU1 command) --- */
+volatile uint32_t emu_command_rx_count = 0;
+volatile uint32_t emu_last_command_tick = 0;
+volatile uint32_t emu_command_timeout_count = 0;
+volatile uint8_t  emu_cmd_run = 0;
+volatile uint8_t  emu_cmd_speed_mode = 0;
+volatile int16_t  emu_cmd_target_phase_current_0p1A = 0;
+volatile int16_t  emu_cmd_target_speed_rpm = 0;
+volatile uint8_t  emu_cmd_life = 0;
+
+/* --- Simulated motor model (ramps toward commanded target) --- */
+volatile int32_t emu_sim_speed_ramp_rate_rpm_per_s = 2000;     /* configurable accel */
+volatile int32_t emu_sim_current_ramp_rate_0p1A_per_s = 1000;  /* configurable di/dt */
+volatile uint8_t emu_sim_current_holding_pct = 25;             /* % of target current once at speed */
+volatile int16_t emu_sim_speed_error_threshold_rpm = 50;       /* "approaching target" band */
+
+/* --- MCU1 -> VCU Message I (0x1801D0EF) transmitted feedback --- */
+volatile uint16_t emu_feedback_bus_voltage_0p1V = 720;   /* manually editable, default 72.0V */
+volatile int16_t  emu_feedback_bus_current_0p1A = 0;     /* derived from phase current */
+volatile int16_t  emu_feedback_phase_current_0p1A = 0;   /* driven by motor model */
+volatile int16_t  emu_feedback_speed_rpm = 0;            /* driven by motor model */
+
+/* --- MCU1 -> VCU Message II (0x1802D0EF) transmitted feedback --- */
+volatile int16_t  emu_feedback_controller_temp_C = 25;   /* manually editable */
+volatile int16_t  emu_feedback_motor_temp_C = 25;        /* manually editable */
+volatile uint8_t  emu_controller_running = 0;            /* mirrors simulated RUN state */
+volatile uint8_t  emu_controller_speed_mode = 0;
+
+/* Fault injection for testing (see README for documented vs test-only bits) */
+volatile uint8_t  emu_simulated_fault = 0;    /* 0->1: sets a generic test fault bit */
+volatile uint8_t  emu_fault_byte4 = 0;        /* raw, directly editable */
+volatile uint8_t  emu_fault_byte5 = 0;        /* raw, directly editable */
+volatile uint8_t  emu_fault_byte6 = 0;        /* raw, directly editable */
+volatile uint8_t  emu_life_counter = 0;
+
+/* --- MCU1 -> Meter Message I/II (0x180117EF / 0x180217EF), optional --- */
+volatile uint8_t  emu_throttle_percent = 0;
+volatile uint8_t  emu_gear_raw = 0;            /* 0=NO,1=R,2=N,3=D1,4=D2,5=D3,6=S,7=P */
+volatile uint8_t  emu_brake_active = 0;
+volatile uint8_t  emu_operation_mode_raw = 0;  /* 0=Stop,1=Drive,2=Cruise,3=EBS,4=Hold */
+volatile uint8_t  emu_dc_contactor_on = 0;
+volatile uint8_t  emu_meter_life = 0;
+
+/* --- Transmission counters --- */
+volatile uint32_t emu_status1_tx_count = 0;
+volatile uint32_t emu_status2_tx_count = 0;
+volatile uint32_t emu_meter1_tx_count = 0;
+volatile uint32_t emu_meter2_tx_count = 0;
+
+/* --- Diagnostics: initialization status (HAL_OK == 0) --- */
+volatile uint32_t emu_init_filter_result = 0;
+volatile uint32_t emu_init_start_result = 0;
+volatile uint32_t emu_init_notify_result = 0;
+
+/* --- Diagnostics: CAN register state (captured every task tick) --- */
+volatile uint32_t emu_can_esr = 0;
+volatile uint32_t emu_can_tsr = 0;
+volatile uint32_t emu_can_rf0r = 0;
+volatile uint32_t emu_can_rf1r = 0;
+volatile uint8_t  emu_can_tec = 0;
+volatile uint8_t  emu_can_rec = 0;
+volatile uint8_t  emu_can_lec = 0;
+volatile uint8_t  emu_can_bus_off = 0;
+volatile uint8_t  emu_can_error_passive = 0;
+volatile uint8_t  emu_can_error_warning = 0;
+volatile uint32_t emu_can_hal_error = 0;
+volatile uint32_t emu_can_hal_state = 0;
+
+/* --- Diagnostics: TX operation detail --- */
+volatile uint32_t emu_tx_attempt_count = 0;
+volatile uint32_t emu_tx_hal_ok_count = 0;
+volatile uint32_t emu_tx_hal_busy_count = 0;
+volatile uint32_t emu_tx_hal_error_count = 0;
+volatile uint32_t emu_tx_complete_count = 0;
+
+/* --- Diagnostics: RX detail --- */
+volatile uint32_t emu_rx_frame_count = 0;
+volatile uint32_t emu_bad_dlc_count = 0;
+volatile uint32_t emu_unexpected_id_count = 0;
+
+/* --- Main loop alive --- */
+volatile uint32_t emu_main_loop_alive = 0;
+
+/* ======================================================================
+ * Internal state
+ * ====================================================================== */
+static CAN_RxHeaderTypeDef rxh;
+static CAN_TxHeaderTypeDef txh;
+static uint8_t rxd[8];
+static uint32_t tx_mailbox;
+
+static uint32_t last_handshake_tx = 0;
+static uint32_t last_status1_tx = 0;
+static uint32_t last_status2_tx = 0;
+static uint32_t last_meter1_tx = 0;
+static uint32_t last_meter2_tx = 0;
+static uint32_t last_sim_update = 0;
+static uint32_t prev_tx_free_level = 3;
+
+static uint8_t frame_is_8x(uint8_t value)
+{
+    uint8_t i;
+    if (rxh.DLC != 8) return 0;
+    for (i = 0; i < 8; i++)
+        if (rxd[i] != value) return 0;
+    return 1;
+}
+
+static void led_handshake_on(void)
+{
+    HAL_GPIO_WritePin(LED_HANDSHAKE_PORT, LED_HANDSHAKE_PIN, GPIO_PIN_SET);
+}
+
+static void led_heartbeat_toggle(void)
+{
+    HAL_GPIO_TogglePin(LED_HEARTBEAT_PORT, LED_HEARTBEAT_PIN);
+}
+
+static void led_run_set(uint8_t state)
+{
+    HAL_GPIO_WritePin(LED_RUN_PORT, LED_RUN_PIN, state ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static void led_warning_set(uint8_t state)
+{
+    HAL_GPIO_WritePin(LED_WARNING_PORT, LED_WARNING_PIN, state ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+/* Generic CAN transmit helper with full TX diagnostics */
+static HAL_StatusTypeDef can_transmit(uint32_t ext_id, const uint8_t *data)
+{
+    HAL_StatusTypeDef result;
+
+    txh.ExtId = ext_id;
+    txh.IDE   = CAN_ID_EXT;
+    txh.RTR   = CAN_RTR_DATA;
+    txh.DLC   = 8;
+
+    emu_tx_attempt_count++;
+
+    if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan) == 0)
+    {
+        emu_tx_hal_busy_count++;
+        return HAL_BUSY;
+    }
+
+    result = HAL_CAN_AddTxMessage(&hcan, &txh, (uint8_t *)data, &tx_mailbox);
+    if (result == HAL_OK)
+        emu_tx_hal_ok_count++;
+    else if (result == HAL_BUSY)
+        emu_tx_hal_busy_count++;
+    else
+        emu_tx_hal_error_count++;
+
+    return result;
+}
+
+static void send_handshake(void)
+{
+    uint8_t tx[8] = {EZK_HANDSHAKE_REQUEST_BYTE, EZK_HANDSHAKE_REQUEST_BYTE,
+                      EZK_HANDSHAKE_REQUEST_BYTE, EZK_HANDSHAKE_REQUEST_BYTE,
+                      EZK_HANDSHAKE_REQUEST_BYTE, EZK_HANDSHAKE_REQUEST_BYTE,
+                      EZK_HANDSHAKE_REQUEST_BYTE, EZK_HANDSHAKE_REQUEST_BYTE};
+
+    if (can_transmit(EZK_ID_MCU1_TO_VCU_1, tx) == HAL_OK)
+        emu_handshake_tx_count++;
+}
+
+/* MCU1 -> VCU Message I: bus voltage, bus current, phase current, speed */
+static void send_status1(void)
+{
+    uint8_t tx[8];
+    uint16_t v  = emu_feedback_bus_voltage_0p1V;
+    uint16_t ib = ezk_encode_offset_0p1(emu_feedback_bus_current_0p1A);
+    uint16_t ip = ezk_encode_offset_0p1(emu_feedback_phase_current_0p1A);
+    uint16_t sp = ezk_encode_offset_0p1(emu_feedback_speed_rpm);
+
+    u16le_store(&tx[0], v);
+    u16le_store(&tx[2], ib);
+    u16le_store(&tx[4], ip);
+    u16le_store(&tx[6], sp);
+
+    if (can_transmit(EZK_ID_MCU1_TO_VCU_1, tx) == HAL_OK)
+        emu_status1_tx_count++;
+}
+
+/* MCU1 -> VCU Message II: temperatures, RUN/mode, faults, life counter */
+static void send_status2(void)
+{
+    uint8_t tx[8];
+    uint8_t byte4 = emu_fault_byte4;
+
+    if (emu_simulated_fault)
+        byte4 |= 0x01; /* bit0: generic test-only fault flag, not a documented manufacturer bit */
+
+    tx[0] = (uint8_t)(emu_feedback_controller_temp_C + 40);
+    tx[1] = (uint8_t)(emu_feedback_motor_temp_C + 40);
+
+    tx[2] = 0;
+    if (emu_controller_running)    tx[2] |= (1U << 0);
+    if (emu_controller_speed_mode) tx[2] |= (1U << 1);
+
+    tx[3] = 0; /* reserved */
+    tx[4] = byte4;
+    tx[5] = emu_fault_byte5;
+    tx[6] = emu_fault_byte6;
+    tx[7] = emu_life_counter++;
+
+    if (can_transmit(EZK_ID_MCU1_TO_VCU_2, tx) == HAL_OK)
+        emu_status2_tx_count++;
+}
+
+/* MCU1 -> Meter Message I: voltage/current/speed (same fields as Status I) */
+static void send_meter1(void)
+{
+    uint8_t tx[8];
+    uint16_t v  = emu_feedback_bus_voltage_0p1V;
+    uint16_t ib = ezk_encode_offset_0p1(emu_feedback_bus_current_0p1A);
+    uint16_t ip = ezk_encode_offset_0p1(emu_feedback_phase_current_0p1A);
+    /* Speed field: Meter V1.1 PDF documentation is ambiguous for this field
+     * (see README - "METER SPEED AMBIGUITY"). This emulator encodes it
+     * identically to the unambiguous MCU->VCU Status I speed field
+     * (1 rpm/bit, offset -32000) purely so the bench test has a known,
+     * self-consistent value to decode on the VCU side. This is an
+     * IMPLEMENTATION CHOICE, not a confirmed manufacturer encoding. */
+    uint16_t sp = ezk_encode_offset_0p1(emu_feedback_speed_rpm);
+
+    u16le_store(&tx[0], v);
+    u16le_store(&tx[2], ib);
+    u16le_store(&tx[4], ip);
+    u16le_store(&tx[6], sp);
+
+    if (can_transmit(EZK_ID_MCU1_TO_METER_1, tx) == HAL_OK)
+        emu_meter1_tx_count++;
+}
+
+/* MCU1 -> Meter Message II: throttle/gear/brake/mode/contactor/faults/life */
+static void send_meter2(void)
+{
+    uint8_t tx[8];
+
+    tx[0] = (uint8_t)(emu_feedback_controller_temp_C + 40);
+    tx[1] = (uint8_t)(emu_feedback_motor_temp_C + 40);
+    tx[2] = emu_throttle_percent;
+
+    tx[3] = 0;
+    tx[3] |= (emu_gear_raw & 0x07);
+    tx[3] |= (emu_brake_active ? (1U << 3) : 0);
+    tx[3] |= ((emu_operation_mode_raw & 0x07) << 4);
+    tx[3] |= (emu_dc_contactor_on ? (1U << 7) : 0);
+
+    tx[4] = emu_fault_byte4;
+    tx[5] = emu_fault_byte5;
+    tx[6] = emu_fault_byte6;
+    tx[7] = emu_meter_life++;
+
+    if (can_transmit(EZK_ID_MCU1_TO_METER_2, tx) == HAL_OK)
+        emu_meter2_tx_count++;
+}
+
+static void parse_handshake_reply(void)
+{
+    emu_handshake_reply_count++;
+    emu_handshake_established = 1;
+    led_handshake_on();
+}
+
+static void parse_vcu_command(void)
+{
+    uint16_t raw;
+
+    emu_command_rx_count++;
+    emu_last_command_tick = HAL_GetTick();
+    led_heartbeat_toggle();
+
+    raw = u16le(&rxd[0]);
+    emu_cmd_target_phase_current_0p1A = ezk_decode_offset_0p1(raw);
+
+    raw = u16le(&rxd[2]);
+    emu_cmd_target_speed_rpm = ezk_decode_offset_0p1(raw);
+
+    emu_cmd_run        = (rxd[4] >> 0) & 0x01;
+    emu_cmd_speed_mode = (rxd[4] >> 1) & 0x01;
+    emu_cmd_life        = rxd[7];
+
+    emu_controller_speed_mode = emu_cmd_speed_mode;
+}
+
+/* ======================================================================
+ * Simulated motor ramp model
+ * ====================================================================== */
+static void sim_motor_step(uint32_t dt_ms)
+{
+    int32_t target_speed;
+    int32_t speed_err;
+    int32_t max_speed_step;
+    int32_t target_current;
+    int32_t current_err;
+    int32_t max_current_step;
+
+    /* RUN=0 (or watchdog timeout, which also clears emu_cmd_run) always
+     * targets zero speed/current, regardless of the last commanded target. */
+    target_speed = emu_cmd_run ? emu_cmd_target_speed_rpm : 0;
+
+    speed_err = target_speed - emu_feedback_speed_rpm;
+    max_speed_step = (emu_sim_speed_ramp_rate_rpm_per_s * (int32_t)dt_ms) / 1000;
+    if (max_speed_step < 1) max_speed_step = 1;
+
+    if (speed_err > max_speed_step)
+        emu_feedback_speed_rpm += (int16_t)max_speed_step;
+    else if (speed_err < -max_speed_step)
+        emu_feedback_speed_rpm -= (int16_t)max_speed_step;
+    else
+        emu_feedback_speed_rpm = (int16_t)target_speed;
+
+    /* Phase current: full commanded current while accelerating toward
+     * target speed; tapers to a holding percentage once close to target.
+     * Always targets zero when not running. */
+    if (!emu_cmd_run)
+    {
+        target_current = 0;
+    }
+    else if (abs((int)speed_err) > emu_sim_speed_error_threshold_rpm)
+    {
+        target_current = emu_cmd_target_phase_current_0p1A;
+    }
+    else
+    {
+        target_current = (emu_cmd_target_phase_current_0p1A * (int32_t)emu_sim_current_holding_pct) / 100;
+    }
+
+    current_err = target_current - emu_feedback_phase_current_0p1A;
+    max_current_step = (emu_sim_current_ramp_rate_0p1A_per_s * (int32_t)dt_ms) / 1000;
+    if (max_current_step < 1) max_current_step = 1;
+
+    if (current_err > max_current_step)
+        emu_feedback_phase_current_0p1A += (int16_t)max_current_step;
+    else if (current_err < -max_current_step)
+        emu_feedback_phase_current_0p1A -= (int16_t)max_current_step;
+    else
+        emu_feedback_phase_current_0p1A = (int16_t)target_current;
+
+    /* Bus current: rough analogy, proportional to phase current. */
+    emu_feedback_bus_current_0p1A = emu_feedback_phase_current_0p1A / 3;
+
+    emu_controller_running = (emu_feedback_speed_rpm != 0 || emu_cmd_run) ? emu_cmd_run : 0;
+
+    led_run_set(emu_cmd_run);
+}
+
+/* ======================================================================
+ * CAN callbacks
+ * ====================================================================== */
+void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *phcan)
+{
+    if (phcan->Instance != CAN1) return;
+
+    if (HAL_CAN_GetRxMessage(phcan, CAN_RX_FIFO1, &rxh, rxd) != HAL_OK)
+        return;
+
+    emu_rx_frame_count++;
+
+    if (rxh.IDE != CAN_ID_EXT) return;
+
+    if (rxh.ExtId != EZK_ID_VCU_TO_MCU1)
+    {
+        emu_unexpected_id_count++;
+        return;
+    }
+
+    if (rxh.DLC != 8)
+    {
+        emu_bad_dlc_count++;
+        return;
+    }
+
+    if (frame_is_8x(EZK_HANDSHAKE_REPLY_BYTE))
+        parse_handshake_reply();
+    else
+        parse_vcu_command();
+}
+
+/* ======================================================================
+ * Public API
+ * ====================================================================== */
+void EZK_MCU_Emulator_Init(void)
+{
+    CAN_FilterTypeDef f = {0};
+
+    f.FilterBank = 0;
+    f.FilterMode = CAN_FILTERMODE_IDMASK;
+    f.FilterScale = CAN_FILTERSCALE_32BIT;
+    f.FilterIdHigh = 0;
+    f.FilterIdLow = 0;
+    f.FilterMaskIdHigh = 0;
+    f.FilterMaskIdLow = 0;
+    f.FilterFIFOAssignment = CAN_FILTER_FIFO1;
+    f.FilterActivation = CAN_FILTER_ENABLE;
+    f.SlaveStartFilterBank = 14;
+
+    emu_init_filter_result = HAL_CAN_ConfigFilter(&hcan, &f);
+    if (emu_init_filter_result != HAL_OK) Error_Handler();
+
+    emu_init_start_result = HAL_CAN_Start(&hcan);
+    if (emu_init_start_result != HAL_OK) Error_Handler();
+
+    /* Only CAN1 RX FIFO1 interrupt is enabled in NVIC by this project's
+     * CubeMX config (proven working configuration - see README). TX
+     * completion and bus error state are instead polled from CAN
+     * registers every task tick (see capture_can_diagnostics() and
+     * the mailbox free-level tracking in EZK_MCU_Emulator_Task()),
+     * so no additional NVIC lines (CAN1_TX_IRQn, CAN1_SCE_IRQn) are
+     * required. */
+    emu_init_notify_result = HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO1_MSG_PENDING);
+    if (emu_init_notify_result != HAL_OK) Error_Handler();
+
+    led_warning_set(1);
+    led_run_set(0);
+
+    last_handshake_tx = HAL_GetTick();
+    last_status1_tx   = HAL_GetTick();
+    last_status2_tx    = HAL_GetTick();
+    last_meter1_tx     = HAL_GetTick();
+    last_meter2_tx     = HAL_GetTick();
+    last_sim_update    = HAL_GetTick();
+    emu_last_command_tick = HAL_GetTick();
+}
+
+static void capture_can_diagnostics(void)
+{
+    if (hcan.Instance != CAN1) return;
+
+    emu_can_esr  = hcan.Instance->ESR;
+    emu_can_tsr  = hcan.Instance->TSR;
+    emu_can_rf0r = hcan.Instance->RF0R;
+    emu_can_rf1r = hcan.Instance->RF1R;
+
+    emu_can_tec = (uint8_t)((emu_can_esr >> 16) & 0xFF);
+    emu_can_rec = (uint8_t)((emu_can_esr >> 24) & 0xFF);
+    emu_can_lec = (uint8_t)((emu_can_esr >> 4) & 0x07);
+    emu_can_bus_off       = (emu_can_esr >> 2) & 0x01;
+    emu_can_error_passive = (emu_can_esr >> 1) & 0x01;
+    emu_can_error_warning = (emu_can_esr >> 0) & 0x01;
+
+    emu_can_hal_error = HAL_CAN_GetError(&hcan);
+    emu_can_hal_state = (uint32_t)HAL_CAN_GetState(&hcan);
+}
+
+/* A mailbox that transitions from occupied to free did so because its
+ * frame was transmitted (ACKed) - with AutoRetransmission=ENABLE a
+ * mailbox never frees on its own without success. Polling this avoids
+ * needing the CAN1_TX_IRQn NVIC line. */
+static void poll_tx_complete(void)
+{
+    uint32_t free_level = HAL_CAN_GetTxMailboxesFreeLevel(&hcan);
+    if (free_level > prev_tx_free_level)
+        emu_tx_complete_count += (free_level - prev_tx_free_level);
+    prev_tx_free_level = free_level;
+}
+
+void EZK_MCU_Emulator_Task(void)
+{
+    uint32_t now = HAL_GetTick();
+    uint32_t time_since_command;
+
+    emu_main_loop_alive++;
+    capture_can_diagnostics();
+    poll_tx_complete();
+
+    /* Simulated motor model runs regardless of handshake state so it is
+     * always consistent, but it only matters once feedback is being sent. */
+    if ((uint32_t)(now - last_sim_update) >= SIM_PERIOD_MS)
+    {
+        sim_motor_step((uint32_t)(now - last_sim_update));
+        last_sim_update = now;
+    }
+
+    if (!emu_handshake_established)
+    {
+        if ((uint32_t)(now - last_handshake_tx) >= HANDSHAKE_PERIOD_MS)
+        {
+            send_handshake();
+            last_handshake_tx = now;
+        }
+        led_warning_set(1);
+        return;
+    }
+
+    /* Command watchdog: if no valid VCU command for 250 ms, force safe halt. */
+    time_since_command = (uint32_t)(now - emu_last_command_tick);
+    if (time_since_command >= COMMAND_WATCHDOG_MS)
+    {
+        if (emu_cmd_run != 0)
+            emu_command_timeout_count++;
+
+        emu_cmd_run = 0;
+        emu_cmd_target_phase_current_0p1A = 0;
+        emu_cmd_target_speed_rpm = 0;
+        led_warning_set(1);
+    }
+    else
+    {
+        led_warning_set(0);
+    }
+
+    if ((uint32_t)(now - last_status1_tx) >= STATUS1_PERIOD_MS)
+    {
+        send_status1();
+        last_status1_tx = now;
+    }
+    if ((uint32_t)(now - last_status2_tx) >= STATUS2_PERIOD_MS)
+    {
+        send_status2();
+        last_status2_tx = now;
+    }
+    if ((uint32_t)(now - last_meter1_tx) >= METER1_PERIOD_MS)
+    {
+        send_meter1();
+        last_meter1_tx = now;
+    }
+    if ((uint32_t)(now - last_meter2_tx) >= METER2_PERIOD_MS)
+    {
+        send_meter2();
+        last_meter2_tx = now;
+    }
+}
